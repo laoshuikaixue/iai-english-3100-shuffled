@@ -33,7 +33,7 @@ from reportlab.platypus import (
 
 SOURCE = ROOT / "2025届高考英语《新课程标准》3100词总表.pdf"
 OUTPUT_DIR = ROOT / "output" / "pdf"
-CORRECTED = OUTPUT_DIR / "2025届高考英语《新课程标准》3100词总表（2025校正版）_LaoShui.pdf"
+CORRECTED = OUTPUT_DIR / "2025届高考英语《新课程标准》3100词总表（2025校正版）.pdf"
 DETAILS = OUTPUT_DIR / "2025届高考英语3100词总表_校正明细.pdf"
 TEMP_DIR = ROOT / "tmp" / "pdfs"
 FONT_DIR = TEMP_DIR / "fonts"
