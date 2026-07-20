@@ -34,6 +34,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT  # noqa: E402
 from reportlab.lib.pagesizes import A4  # noqa: E402
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet  # noqa: E402
 from reportlab.lib.units import mm  # noqa: E402
+from reportlab.pdfbase import pdfmetrics  # noqa: E402
 from reportlab.platypus import (  # noqa: E402
     LongTable,
     Paragraph,
@@ -69,24 +70,86 @@ def normalize_text(text: str) -> str:
 
 
 def quiz_headword(entry: Entry) -> str:
-    headword = normalize_text(entry.headword)
+    first_row = normalize_text(entry.rows[0])
+    acronym = re.match(
+        r"^(AI\s*\(=artificial intelligence\)|BCE\s*\(Before the Common Era\)|CE（Common Era）)\**",
+        first_row,
+    )
+    headword = acronym.group(1) if acronym else normalize_text(entry.headword)
     headword = re.sub(r"\s+(?:BrE|AmE)$", "", headword)
     headword = re.sub(r"\*+$", "", headword)
     return headword.strip()
 
 
+def contains_chinese(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def remove_non_chinese_parentheses(text: str) -> str:
+    pattern = re.compile(r"([（(])([^()（）]*)([）)])")
+
+    def replace(match: re.Match[str]) -> str:
+        content = match.group(2).strip()
+        if not contains_chinese(content) or re.search(r"[A-Za-z]", content):
+            return " "
+        return f"（{content}）"
+
+    previous = None
+    while text != previous:
+        previous = text
+        text = pattern.sub(replace, text)
+    return text
+
+
+def balance_chinese_parentheses(text: str) -> str:
+    output: list[str] = []
+    open_positions: list[int] = []
+    for char in text:
+        if char == "（":
+            open_positions.append(len(output))
+            output.append(char)
+        elif char == "）":
+            if open_positions:
+                open_positions.pop()
+                output.append(char)
+        else:
+            output.append(char)
+    for position in reversed(open_positions):
+        del output[position]
+    return "".join(output)
+
+
 def chinese_prompt(entry: Entry) -> str:
     full_text = normalize_text(" ".join(entry.rows))
-    raw_headword = normalize_text(entry.headword)
-    remainder = full_text[len(raw_headword) :] if full_text.startswith(raw_headword) else full_text
+    headword = quiz_headword(entry)
+    remainder = full_text[len(headword) :] if full_text.startswith(headword) else full_text
+    remainder = re.sub(r"^\*+", "", remainder).lstrip()
 
-    # Remove pronunciation and English-only labels before retaining the Chinese clue.
-    remainder = re.sub(r"(?:BrE|AmE)\s*/[^/]+/", " ", remainder)
-    remainder = re.sub(r"/[^/]{1,120}/", " ", remainder)
+    # A slash pair is pronunciation only when its contents have no Chinese.
+    # This preserves real Chinese alternatives such as 上方/部 and 上层/流.
+    remainder = re.sub(
+        r"/([^/\n]{1,120})/",
+        lambda match: " " if not contains_chinese(match.group(1)) else match.group(0),
+        remainder,
+    )
+    # Remove English-only inflection notes and abbreviations as complete units,
+    # rather than leaving their commas and closing parentheses behind.
+    remainder = remove_non_chinese_parentheses(remainder)
+    remainder = re.sub(
+        r"\[([^\[\]]*)\]",
+        lambda match: match.group(0) if contains_chinese(match.group(1)) else " ",
+        remainder,
+    )
+    # Convert part-of-speech boundaries into a readable Chinese separator.
+    remainder = re.sub(
+        r"(?i)(?<![A-Za-z])(?:modal\s+v|aux(?:iliary)?\s+v|art|adj|adv|prep|pron|conj|num|det|int|abbr|vt|vi|pl|n|v|ad|a)\.?(?=\s|[A-Za-z\u4e00-\u9fff（(\[<])",
+        "；",
+        remainder,
+    )
     remainder = re.sub(r"[A-Za-z]+(?:[.'’-][A-Za-z]+)*", " ", remainder)
 
     allowed_punctuation = set(
-        "，。；：、（）()《》〈〉…“”‘’！!?？-—·/＋+＝=,."
+        "，。；：、（）()《》〈〉…“”‘’！!?？-—·/＋+＝=,.%％℃°"
     )
     kept: list[str] = []
     for char in remainder:
@@ -95,8 +158,24 @@ def chinese_prompt(entry: Entry) -> str:
         else:
             kept.append(" ")
     prompt = normalize_text("".join(kept))
-    prompt = re.sub(r"^[\s，。；：、/()（）.。-]+", "", prompt)
-    prompt = re.sub(r"[\s，。；：、/.]+$", "", prompt)
+    prompt = prompt.translate(str.maketrans({",": "，", ";": "；", ":": "：", "!": "！", "?": "？"}))
+    prompt = re.sub(r"\.{2,}", "…", prompt)
+    prompt = re.sub(r"(?<!\d)\.(?!\d)", "", prompt)
+    prompt = prompt.replace("(", "（").replace(")", "）")
+    prompt = re.sub(r"\s*([，。；：、！？）])\s*", r"\1", prompt)
+    prompt = re.sub(r"\s*（\s*", "（", prompt)
+    prompt = re.sub(
+        r"(?<=[\u4e00-\u9fff）])\s+(?=[\u4e00-\u9fff（])",
+        "",
+        prompt,
+    )
+    prompt = re.sub(r"[；，]{2,}", "；", prompt)
+    prompt = re.sub(r"；(?=[，。；：])", "", prompt)
+    prompt = re.sub(r"，(?=[，。；：])", "", prompt)
+    prompt = balance_chinese_parentheses(prompt)
+    prompt = re.sub(r"^[\s，。；：、/）.。-]+", "", prompt)
+    prompt = re.sub(r"[\s，。；：、/.（]+$", "", prompt)
+    prompt = re.sub(r"(?:反|同|派生)$", "", prompt).rstrip("，。；：、 ")
     return prompt or "（请根据词条释义作答）"
 
 
@@ -119,23 +198,121 @@ def make_questions(entries: list[Entry], mode: str) -> list[Question]:
 
 
 def answer_text(question: Question) -> str:
-    return normalize_text(" ".join(question.entry.rows))
+    text = normalize_text(" ".join(question.entry.rows))
+    text = re.sub(
+        r"(?<=[\u4e00-\u9fff）])\s+(?=[\u4e00-\u9fff（])",
+        "",
+        text,
+    )
+    text = re.sub(r"(?<=[\u4e00-\u9fff）])\s+(?=[，。；：、！？])", "", text)
+    text = re.sub(r"(?<=[，。；：、！？])\s+(?=[\u4e00-\u9fff（])", "", text)
+    return text
+
+
+NO_LINE_START_PUNCTUATION = set("，。；：、！？）》】」』”’％%,.;:!?/)")
+
+
+def text_width(text: str, font_size: float, cjk_font, latin_font) -> float:
+    width = 0.0
+    for char in text:
+        codepoint = ord(char)
+        use_latin = (
+            codepoint < 0x0250 or 0x0250 <= codepoint <= 0x02FF
+        ) and latin_font.has_glyph(codepoint)
+        if not cjk_font.has_glyph(codepoint) and latin_font.has_glyph(codepoint):
+            use_latin = True
+        font_name = "TimesNewRoman" if use_latin else "STKaiti"
+        width += pdfmetrics.stringWidth(char, font_name, font_size)
+    return width
+
+
+def wrap_text_for_cell(
+    text: str,
+    first_line_width: float,
+    later_line_width: float,
+    font_size: float,
+    cjk_font,
+    latin_font,
+) -> list[str]:
+    """Pre-wrap text so closing punctuation always remains on the prior line."""
+    lines: list[str] = []
+    current: list[str] = []
+    current_width = 0.0
+    limit = first_line_width
+
+    for char in text:
+        char_width = text_width(char, font_size, cjk_font, latin_font)
+        if current and current_width + char_width > limit:
+            if char in NO_LINE_START_PUNCTUATION:
+                current.append(char)
+                lines.append("".join(current))
+                current = []
+                current_width = 0.0
+                limit = later_line_width
+                continue
+            lines.append("".join(current))
+            current = [char]
+            current_width = char_width
+            limit = later_line_width
+        else:
+            current.append(char)
+            current_width += char_width
+
+    if current:
+        lines.append("".join(current))
+    # A closing bracket can itself fill the line and be followed by another
+    # punctuation mark. Move any such leading punctuation back after wrapping.
+    line_index = 1
+    while line_index < len(lines):
+        leading: list[str] = []
+        while lines[line_index] and lines[line_index][0] in NO_LINE_START_PUNCTUATION:
+            leading.append(lines[line_index][0])
+            lines[line_index] = lines[line_index][1:]
+        if leading:
+            lines[line_index - 1] += "".join(leading)
+        if not lines[line_index]:
+            del lines[line_index]
+        else:
+            line_index += 1
+    return lines or [""]
 
 
 def question_text(
     question: Question, cjk_font, latin_font, show_direction: bool
 ) -> str:
     if question.direction == "en_to_zh":
-        prompt = markup_text(quiz_headword(question.entry), cjk_font, latin_font)
+        plain_prompt = quiz_headword(question.entry)
+        direction_markup = ""
+        direction_width = 0.0
         if show_direction:
-            prompt = "<font color='#245A9A'>英</font>　" + prompt
+            direction_markup = "<font color='#245A9A'>英</font>　"
+            direction_width = text_width("英　", 9.6, cjk_font, latin_font)
     else:
-        prompt = markup_text(chinese_prompt(question.entry), cjk_font, latin_font)
+        plain_prompt = chinese_prompt(question.entry)
+        direction_markup = ""
+        direction_width = 0.0
         if show_direction:
-            prompt = "<font color='#A05A00'>中</font>　" + prompt
-    return (
-        f"<b>{question.number}.</b> {prompt}"
-        "<br/><font color='#999999'>________________________________</font>"
+            direction_markup = "<font color='#A05A00'>中</font>　"
+            direction_width = text_width("中　", 9.6, cjk_font, latin_font)
+
+    number_width = pdfmetrics.stringWidth(
+        f"{question.number}. ", "TimesNewRoman-Bold", 9.6
+    )
+    lines = wrap_text_for_cell(
+        plain_prompt,
+        max(120.0, 228.0 - number_width - direction_width),
+        228.0,
+        9.6,
+        cjk_font,
+        latin_font,
+    )
+    first_line = (
+        f"<b>{question.number}.</b> {direction_markup}"
+        + markup_text(lines[0], cjk_font, latin_font)
+    )
+    remaining_lines = [markup_text(line, cjk_font, latin_font) for line in lines[1:]]
+    return "<br/>".join(
+        [first_line, *remaining_lines, "<font color='#999999'>________________________________</font>"]
     )
 
 
@@ -145,7 +322,12 @@ def answer_cell_text(
     direction = "英→中" if question.direction == "en_to_zh" else "中→英"
     marker = f"[{direction}] " if show_direction else ""
     text = f"{question.number}. {marker}{answer_text(question)}"
-    return markup_text(text, cjk_font, latin_font)
+    # Mixed IPA/Latin/CJK runs can measure slightly wider after ReportLab
+    # fragments them by font, so keep a larger safety margin than questions.
+    lines = wrap_text_for_cell(text, 210.0, 210.0, 8.1, cjk_font, latin_font)
+    return "<br/>".join(
+        markup_text(line, cjk_font, latin_font) for line in lines
+    )
 
 
 def draw_header(canvas, document) -> None:
@@ -188,7 +370,7 @@ def build_pdf(
         leading=12.2,
         alignment=TA_LEFT,
         textColor=colors.black,
-        wordWrap="CJK",
+        wordWrap=None,
     )
     answer_style = ParagraphStyle(
         "DictationAnswer",
@@ -280,8 +462,8 @@ def make_outputs(input_pdf: Path, output_dir: Path, seed: str) -> list[Path]:
     stem = f"高中英语3100词默写版（{edition}）"
     variants = [
         ("混合", "mixed", True),
-        ("中文写英文", "zh_to_en", False),
-        ("英文写中文", "en_to_zh", False),
+        ("中写英", "zh_to_en", False),
+        ("英写中", "en_to_zh", False),
     ]
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs: list[Path] = []
